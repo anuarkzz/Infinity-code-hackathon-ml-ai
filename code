@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+import argparse
+import time
+import json
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import IsolationForest
+import requests
+
+try:
+    import pyshark
+    HAS_PYSHARK = True
+except ImportError:
+    HAS_PYSHARK = False
+
+ALERT_WEBHOOK = None
+SEED = 42
+LIVE_WINDOW_SECONDS = 10
+
+def packet_to_basic_features(pkt):
+    if isinstance(pkt, dict):
+        return pkt
+
+    feat = {}
+    try:
+        feat['ts'] = float(pkt.sniff_timestamp)
+    except Exception:
+        feat['ts'] = time.time()
+
+    try:
+        feat['length'] = int(pkt.length)
+    except Exception:
+        feat['length'] = 0
+
+    try:
+        feat['proto'] = pkt.highest_layer
+    except Exception:
+        feat['proto'] = 'UNKNOWN'
+
+    try:
+        feat['src'] = pkt.ip.src
+        feat['dst'] = pkt.ip.dst
+    except Exception:
+        feat['src'] = '0.0.0.0'
+        feat['dst'] = '0.0.0.0'
+
+    try:
+        feat['sport'] = int(pkt.tcp.srcport)
+        feat['dport'] = int(pkt.tcp.dstport)
+    except Exception:
+        try:
+            feat['sport'] = int(pkt.udp.srcport)
+            feat['dport'] = int(pkt.udp.dstport)
+        except Exception:
+            feat['sport'] = 0
+            feat['dport'] = 0
+
+    try:
+        flags = pkt.tcp.flags
+        flags_str = str(flags)
+        feat['tcp_flags'] = int(flags_str, 16) if flags_str.startswith("0x") else int(flags_str)
+    except Exception:
+        feat['tcp_flags'] = 0
+
+    return feat
+
+def aggregate_window(packet_feats):
+    if not packet_feats:
+        return pd.DataFrame()
+    df = pd.DataFrame(packet_feats)
+    for col in ['proto', 'length', 'sport', 'dport', 'tcp_flags', 'ts', 'src', 'dst']:
+        if col not in df.columns:
+            df[col] = 0
+
+    df['length'] = pd.to_numeric(df['length'], errors='coerce').fillna(0).astype(int)
+    df['sport'] = pd.to_numeric(df['sport'], errors='coerce').fillna(0).astype(int)
+    df['dport'] = pd.to_numeric(df['dport'], errors='coerce').fillna(0).astype(int)
+    df['tcp_flags'] = pd.to_numeric(df['tcp_flags'], errors='coerce').fillna(0).astype(int)
+    df['ts'] = pd.to_numeric(df['ts'], errors='coerce').fillna(time.time()).astype(float)
+    df['proto'] = df['proto'].astype(str)
+
+    df['proto_id'] = df['proto'].astype('category').cat.codes
+    flows = []
+    for (src, dst), g in df.groupby(['src', 'dst']):
+        rec = {
+            'src': src,
+            'dst': dst,
+            'pkt_count': int(len(g)),
+            'byte_sum': int(g['length'].sum()),
+            'byte_mean': float(g['length'].mean()),
+            'byte_std': float(g['length'].std()) if len(g) > 1 else 0.0,
+            'proto_mode': int(g['proto_id'].mode().iloc[0]) if not g['proto_id'].mode().empty else 0,
+            'sport_mode': int(g['sport'].mode().iloc[0]) if not g['sport'].mode().empty else 0,
+            'dport_mode': int(g['dport'].mode().iloc[0]) if not g['dport'].mode().empty else 0,
+            'tcp_flags_sum': int(g['tcp_flags'].sum()),
+            'duration': float(g['ts'].max() - g['ts'].min()) if len(g) > 1 else 0.0
+        }
+        flows.append(rec)
+    return pd.DataFrame(flows)
+
+class AnomalyModel:
+    def __init__(self):
+        self.model = IsolationForest(n_estimators=100, contamination=0.01, random_state=SEED)
+        self.trained = False
+
+    def fit(self, X: pd.DataFrame):
+        if X.shape[0] < 5:
+            print("[model] Not enough data for training (need ≥5).")
+            return
+        Xnum = X.select_dtypes(include=[np.number]).fillna(0)
+        self.model.fit(Xnum)
+        self.trained = True
+        print(f"[model] Trained on {Xnum.shape[0]} samples.")
+
+    def score(self, X: pd.DataFrame):
+        if not self.trained:
+            return np.zeros(X.shape[0])
+        Xnum = X.select_dtypes(include=[np.number]).fillna(0)
+        return -self.model.decision_function(Xnum)
+
+    def predict_label(self, X: pd.DataFrame):
+        if not self.trained:
+            return np.zeros(X.shape[0], dtype=int)
+        Xnum = X.select_dtypes(include=[np.number]).fillna(0)
+        pred = self.model.predict(Xnum)
+        return np.where(pred == -1, 1, 0)
+
+def send_alert(record, score, reason):
+    payload = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "src": record.get("src"),
+        "dst": record.get("dst"),
+        "pkt_count": int(record.get("pkt_count", 0)),
+        "byte_sum": int(record.get("byte_sum", 0)),
+        "score": float(score),
+        "reason": reason,
+        "recommendation": recommendation_from_reason(reason),
+    }
+    print(f"[ALERT] {payload['src']} -> {payload['dst']} score={payload['score']:.3f} reason={reason}")
+    print(json.dumps(payload, indent=2))
+    if ALERT_WEBHOOK:
+        try:
+            requests.post(ALERT_WEBHOOK, json=payload, timeout=2)
+        except Exception as e:
+            print(f"[alert] Webhook error: {e}")
+
+def recommendation_from_reason(reason):
+    if "high_bytes" in reason:
+        return "Check payload, limit connection, enable DPI."
+    if "short_lived_burst" in reason:
+        return "Detailed capture, check for port scan."
+    return "Increase logging and analyze packets."
+
+class Detector:
+    def __init__(self, model: AnomalyModel):
+        self.model = model
+
+    def analyze(self, df_window):
+        features = [
+            "pkt_count", "byte_sum", "byte_mean", "byte_std",
+            "proto_mode", "sport_mode", "dport_mode",
+            "tcp_flags_sum", "duration"
+        ]
+        for c in features:
+            if c not in df_window.columns:
+                df_window[c] = 0
+        X = df_window[features].fillna(0)
+
+        scores = self.model.score(X)
+        labels = self.model.predict_label(X)
+        threshold = np.percentile(scores, 90) if len(scores) > 0 else 0
+
+        for i, rec in df_window.reset_index(drop=True).iterrows():
+            s, lbl = float(scores[i]), int(labels[i])
+            if lbl == 1 or s > threshold:
+                reason = "high_bytes" if rec.get("byte_sum", 0) > 1_000_000 else "model_anomaly"
+                send_alert(rec.to_dict(), s, reason)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--csv", help="CSV file with traffic", default=None)
+    parser.add_argument("--pcap", help="PCAP file (needs pyshark)", default=None)
+    parser.add_argument("--iface", help="Live interface (needs pyshark)", default=None)
+    parser.add_argument("--webhook", help="Webhook for alerts", default=None)
+    parser.add_argument("--window", type=int, help="Window size in seconds for live mode", default=LIVE_WINDOW_SECONDS)
+    args = parser.parse_args()
+
+    global ALERT_WEBHOOK
+    ALERT_WEBHOOK = args.webhook
+
+    model = AnomalyModel()
+    detector = Detector(model)
+
+    if args.csv:
+        df = pd.read_csv(args.csv)
+        expected = ['ts', 'src', 'dst', 'length', 'proto', 'sport', 'dport', 'tcp_flags']
+        for c in expected:
+            if c not in df.columns:
+                df[c] = 0 if c != 'proto' else 'UNKNOWN'
+
+        df['ts'] = pd.to_numeric(df['ts'], errors='coerce').fillna(time.time()).astype(float)
+        for c in ['length', 'sport', 'dport', 'tcp_flags']:
+            df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0).astype(int)
+        df['proto'] = df['proto'].astype(str)
+        packets = df.to_dict(orient="records")
+        df_window = aggregate_window(packets)
+        features = [
+            "pkt_count", "byte_sum", "byte_mean", "byte_std",
+            "proto_mode", "sport_mode", "dport_mode",
+            "tcp_flags_sum", "duration"
+        ]
+        if not df_window.empty:
+            model.fit(df_window[features])
+            detector.analyze(df_window)
+        else:
+            print("[main] No flows extracted from CSV.")
+        print("[main] CSV analysis done.")
+        return
+
+    if args.pcap or args.iface:
+        if not HAS_PYSHARK:
+            print("[main] pyshark not found. Use --csv for offline analysis or install pyshark/tshark.")
+            return
+
+    if args.pcap:
+        cap = None
+        packets = []
+        try:
+            cap = pyshark.FileCapture(args.pcap, keep_packets=False)
+            for pkt in cap:
+                packets.append(packet_to_basic_features(pkt))
+        except Exception as e:
+            print(f"[main] Error reading pcap: {e}")
+        finally:
+            if cap is not None:
+                try:
+                    cap.close()
+                except Exception:
+                    pass
+
+        df_window = aggregate_window(packets)
+        if not df_window.empty:
+            model.fit(df_window.drop(columns=["src", "dst"], errors="ignore"))
+            detector.analyze(df_window)
+        print("[main] PCAP analysis done.")
+        return
+
+    if args.iface:
+        print(f"[main] Live capture mode (window {args.window} sec, Ctrl-C to stop)")
+        cap = pyshark.LiveCapture(interface=args.iface)
+        buffer = []
+        window_start = time.time()
+        try:
+            for pkt in cap.sniff_continuously():
+                buffer.append(packet_to_basic_features(pkt))
+                now = time.time()
+                if now - window_start >= args.window:
+                    df_window = aggregate_window(buffer)
+                    if not df_window.empty:
+                        if not model.trained:
+                            model.fit(df_window.drop(columns=["src", "dst"], errors="ignore"))
+                        detector.analyze(df_window)
+                    buffer = []
+                    window_start = now
+        except KeyboardInterrupt:
+            print("[main] Stopped by user.")
+        except Exception as e:
+            print(f"[main] Live capture error: {e}")
+        finally:
+            try:
+                cap.close()
+            except Exception:
+                pass
+
+if __name__ == "__main__":
+    main()
